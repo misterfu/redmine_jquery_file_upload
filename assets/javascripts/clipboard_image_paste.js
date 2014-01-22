@@ -10,16 +10,12 @@
 // - GNU GENERAL PUBLIC LICENSE Version 2
 //******************************************************************************
 
-
 //----------------------------------------------------------------------------
 // Enclose everything inside a namespace.
 (function(cbImagePaste, $, undefined) {
 
   // pasted image
   var pastedImage;
-
-  // raw pasted Image
-  var rawPastedImage
 
   // dialog object
   var dialog;
@@ -30,6 +26,10 @@
   // actual crop coordinates
   var cropCoords;
 
+  // true if the browser has compatible clipboard
+  var hasClipboard;
+
+
   //****************************************************************************
   //
   // paste dialog stuff:
@@ -39,14 +39,14 @@
   //----------------------------------------------------------------------------
   // Show paste dialog.
   cbImagePaste.showPasteDialog = function() {
-    var browserMajor = parseInt($.browser.version, 10);
-    //alert("maj=" + browserMajor + "  webkit=" + $.browser.webkit + "  min_chrome=" + cbImagePaste.cbp_min_chrome_ver);
-
-    if (!(
-        ($.browser.mozilla && browserMajor >= cbImagePaste.cbp_min_firefox_ver) ||
-        ($.browser.webkit && typeof window.chrome === "object" && browserMajor >= cbImagePaste.cbp_min_chrome_ver)
-       )) {
+    if (!isBrowserSupported()) {
       alert(cbImagePaste.cbp_txt_wrong_browser);
+      return false;
+    }
+
+    var fields = checkAttachFields();
+    if (!fields) {
+      alert(cbImagePaste.cbp_txt_too_many_files);
       return false;
     }
 
@@ -69,17 +69,57 @@
         dialog = this;
       },
       open: function(event, ui) {
-        window.cbpDialogOpened = true;
         initDialog();
       },
       close: function(event, ui) {
         deinitDialog();
         delete dialog;
-        window.cbpDialogOpened = false;
       },
       resize: function(event, ui) {
         resizePanel();
       }
+    });
+  };
+
+  //----------------------------------------------------------------------------
+  // Check supported browser version.
+  // We support Firefox & Chrome only. Even if other browsers use the same
+  // layout engine (Gecko or WebKit) thay may not support Ctrl+V properly.
+  function isBrowserSupported() {
+    //alert("min_firefox=" + cbImagePaste.cbp_min_firefox_ver + "\n" +
+    //      "min_chrome=" + cbImagePaste.cbp_min_chrome_ver + "\n" +
+    //      "agent='" + navigator.userAgent + "'\n");
+
+    var M = navigator.userAgent.match(/(firefox|webkit)\/?\s*(\.?\d+(\.\d+)*)/i);
+
+    if (M) {
+      var browserMajor = parseInt(M[2], 10);
+      M[1] = M[1].toLowerCase();
+
+      var isCompatChrome = (M[1] == 'webkit' && typeof window.chrome === "object" && browserMajor >= cbImagePaste.cbp_min_chrome_ver);
+      hasClipboard = isCompatChrome;
+
+      if (isCompatChrome ||
+          (M[1] == 'firefox' && browserMajor >= cbImagePaste.cbp_min_firefox_ver))
+        return true;
+    }
+    return false;
+  };
+
+  //----------------------------------------------------------------------------
+  // Show copy wiki link dialog.
+  function showCopyLink(btn, name) {
+    $("#cbp_image_link").val("!" + name.val() + "!");
+    $("#cbp_thumbnail_link").val("{{thumbnail(" + name.val() + ")}}");
+
+    $("#cbp_link_dlg").dialog({
+      closeOnEscape: true,
+      modal: true,
+      resizable: false,
+      dialogClass: "cbp_drop_shadow cbp_dlg_small",
+      position: { my: "left top", at: "left bottom", of: btn },
+      minHeight: 0,
+      width: "auto"
     });
   };
 
@@ -307,7 +347,7 @@
   // Handle paste events
   function pasteHandler(e) {
     // We need to check if event.clipboardData is supported (Chrome)
-    if (e.clipboardData) {
+    if (hasClipboard && e.clipboardData) {
       // Get the items from the clipboard
       var items = e.clipboardData.items;
       if (!items)
@@ -317,18 +357,18 @@
         for (var i = 0; i < items.length; i++) {
           if (items[i].type.indexOf("image") !== -1) {
             // We need to represent the image as a file,
-            rawPastedImage = items[i].getAsFile();
+            var blob = items[i].getAsFile();
             // and use a URL or webkitURL (whichever is available to the browser)
             // to create a temporary URL to the object
             var URLObj = window.URL || window.webkitURL;
-            var source = URLObj.createObjectURL(rawPastedImage);
+            var source = URLObj.createObjectURL(blob);
 
             // The URL can then be used as the source of an image
             createImage(source);
             return;
           }
         }
-       alert(cbImagePaste.cbp_txt_no_image_cb);
+        alert(cbImagePaste.cbp_txt_no_image_cb);
       }
     // If we can't handle clipboard data directly (Firefox),
     // we need to read what was pasted from the contenteditable element
@@ -351,12 +391,10 @@
      if (child) {
         // If the user pastes an image, the src attribute
         // will represent the image as a base64 encoded string.
-        if (child.tagName === "IMG") {
-          rawPastedImage = child.src.indexOf(';base64,') >= 0 ? dataURLtoBlob(child.src) : child.src;
+        if (child.tagName === "IMG")
           createImage(child.src);
-        } else {
+        else
           alert(cbImagePaste.cbp_txt_no_image_cb);
-        }
      }
   };
 
@@ -380,6 +418,12 @@
   // see attachment_patch.rb
   var imageAttachIdOfs = 10000;
 
+  // image field counter
+  var imageAttachCount = 0;
+
+  // skeleton with input fields
+  var inputSkeleton;
+
   //----------------------------------------------------------------------------
   // Insert attachment input tag into document.
   function insertAttachment() {
@@ -388,55 +432,79 @@
       return;
     }
 
-    try {
-      var dataUrl = getImageUrl(), file;
-      file = dataURLtoBlob(dataUrl);
-      addToJqueryFileUploadQueue(file);
-      // when browser throws security error when called method toDataURL on canvas object,
-      // we need to crop an image on a server
-    } catch (error) {
-      var xhr = new XMLHttpRequest(), formData = new FormData(), cropArea = [];
-      // set the cropped area into dimensions object
-      cropArea.push(Math.round(cropCoords.x));
-      cropArea.push(Math.round(cropCoords.y));
-      cropArea.push(Math.round(cropCoords.w));
-      cropArea.push(Math.round(cropCoords.h));
+    var fields = checkAttachFields();
+    if (!fields)
+      return false;
 
-      // send to the server image with crop area
-      formData.append('image', rawPastedImage);
-      formData.append('crop_area', cropArea.join(','));
-      xhr.open('POST', '/jquery_files/crop', true);
-      // this is need to verify CSRF token authenticity
-      xhr.setRequestHeader('X-CSRF-Token', $('meta[name="csrf-token"]').attr('content'));
-      // we expect blob object into response
-      xhr.responseType = 'blob';
-      xhr.onload = function(e) {
-        file = this.response;
-        addToJqueryFileUploadQueue(file);
-      };
-      xhr.send(formData);
-    }
-  };
+    var dataUrl = getImageUrl();
 
-  //----------------------------------------------------------------------------
-  // add file to jQueryFileUpload plugin queue
-  function addToJqueryFileUploadQueue(file) {
-    if (file.length > cbImagePaste.cbp_max_attach_size) {
+    if (dataUrl.length > cbImagePaste.cbp_max_attach_size) {
       alert(cbImagePaste.cbp_txt_too_big_image);
       return;
     }
-    file.fromClipboard = true;
-    // manually call method add from jQueryFileUpload plugin
-    window.$('#attachments_fields').fileupload('add', { files: [file] });
+
+    // inspired by redmine/public/javascripts/application.js
+    imageAttachCount++;
+
+    // generate "unique" identifier, using "random" part cbImagePaste.cbp_act_update_id
+    var attachId    = cbImagePaste.cbp_act_update_id + "-" + imageAttachCount;
+    var attachInpId = "attachments[" + (imageAttachIdOfs + imageAttachCount) + "]";
+
+    var s = inputSkeleton.clone();
+    s.css("display", "block");
+
+    // show thumbnail in attachment preview
+    var elements = s.find("#cbp_attach_thumbnail");
+    elements.attr("src", dataUrl);
+    //elements.attr("title", "image attachment " + attachId + " preview").val("");
+
+    dataUrl = dataUrl.substring(dataUrl.indexOf("iVBOR"));
+
+    elements = s.children("#cbp_image_data");
+    elements.attr("name", attachInpId + "[data]").val("");
+    elements.attr("value", dataUrl).val(dataUrl);
+
+    elements = s.children("input.name");
+    elements.attr("name", attachInpId + "[name]").val("");
+    var pictureName = "picture" + attachId + ".png";
+    elements.attr("value", pictureName).val(pictureName);
+
+    // limit user input for attachment file name
+    elements.each(function() {
+      $(this).blur(function() {
+        this.value = this.value.replace(/^\s+|\s+$/g, '');
+        if (this.value == '')
+          this.value = this.defaultValue;
+        else if (this.value.search(/\.png$/) < 1)
+          this.value += ".png";
+        this.value = this.value.replace(/[\/\\!%\?\*:'"\|<>&]/g, "-");
+        this.value = this.value.replace(/ /g, "_");
+      });
+    });
+
+    elements = s.children("input.description");
+    elements.attr("name", attachInpId + "[description]").val("");
+
+    // add onclick handler for copy link button
+    elements = s.children("#cbp_link_btn");
+    elements.each(function() {
+      $(this).click(function(el) {
+        showCopyLink($(this), $(this).prev());
+        return false;
+      });
+    });
+
+    fields.append(s);
+
     $(dialog).dialog("close");
-  }
+  };
 
   //----------------------------------------------------------------------------
   // Create final image url.
   function getImageUrl() {
     // create temporary canvas
     var dst = document.createElement("canvas");
-    dst.width = Math.round(cropCoords.w);
+    dst.width  = Math.round(cropCoords.w);
     dst.height = Math.round(cropCoords.h);
     var ctx = dst.getContext("2d");
     // draw image
@@ -445,6 +513,17 @@
       0, 0, dst.width, dst.height);
 
     return dst.toDataURL("image/png");
+  };
+
+  //----------------------------------------------------------------------------
+  // Check maximum number of attachment fields, return fields element.
+  function checkAttachFields() {
+    var fileFields  = $("#attachments_fields");
+    var imageFields = $("#cbp_image_fields");
+    if (!fileFields || !imageFields ||
+      (fileFields.children().length + imageFields.children().length) >= cbImagePaste.cbp_max_attachments)
+      return;
+    return imageFields;
   };
 
   //----------------------------------------------------------------------------
@@ -458,6 +537,11 @@
   // Move image attachment block to proper place (after "add another file" link).
   // and detach element not required in DOM.
   $(document).ready(function() {
+    // detach input skeleton from the form avoiding posting it
+    inputSkeleton = $("#cbp_image_field");
+    if (inputSkeleton)
+      inputSkeleton.detach();
+
     // since our form is hooked to all Redmine's pages, detach it always,
     // if it is needed on the page, we will attach it below
     var imageForm = $("#cbp_images_form");
@@ -471,11 +555,11 @@
     if (!attachFields)
       return;
 
-    addFile = $('#add_cpb_img');
+    var addFile = attachFields.next("span.add_attachment");
     if (!addFile)
       return;
 
-    addFile.html(imageForm);
+    addFile.after(imageForm);
   });
 
 }(window.cbImagePaste = window.cbImagePaste || {}, jQuery));
